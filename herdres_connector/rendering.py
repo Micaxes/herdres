@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from typing import Any
 
 from .safe import compact_ws, html_escape, sanitize_text
 
@@ -65,12 +65,7 @@ def worker_label(entry: dict[str, Any] | None, worker: dict[str, Any] | None = N
 
 
 def html_to_plain(value: str, *, limit: int = 12000) -> str:
-    # Table-aware: adjacent cells become ` | ` and row/block ends become newlines, so a <table> that
-    # never reaches the rich path (rich disabled / oversize fallback) degrades to readable
-    # `|`-separated rows rather than mashed-together cell text.
-    text = re.sub(r"</t[dh]>\s*<t[dh]\b[^>]*>", " | ", value, flags=re.IGNORECASE)
-    text = re.sub(r"</tr>\s*", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<br\s*/?>", "\n", value)
     text = re.sub(r"<[^>]+>", "", text)
     return sanitize_text(text, limit)
 
@@ -92,112 +87,12 @@ def _inline_markdown_html(text: str) -> str:
     return escaped
 
 
-# A GitHub-style pipe-table delimiter row, e.g. ``| :--- | ---: |`` or ``---|---``.
-_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$")
-_TABLE_MAX_ROWS = 40
-
-
-def _looks_like_table_row(line: str) -> bool:
-    return "|" in line and bool(line.strip())
-
-
-def _looks_like_table_separator(line: str) -> bool:
-    # Require a pipe: a bare `---`/`------` under a pipe-containing prose line (e.g. a horizontal rule
-    # after "run `foo | grep bar`") is NOT a table delimiter — matching GitHub, which needs the pipe
-    # structure. This is the guard against mangling ordinary prose + rules into a fake table.
-    s = line.strip()
-    return "-" in s and "|" in s and bool(_TABLE_SEPARATOR_RE.match(s))
-
-
-def _table_cells(line: str) -> list[str]:
-    """Split a pipe-table row into cells, respecting inline-code spans and escaped ``\\|`` so a pipe
-    inside ``\\`a | b\\``` or written ``\\|`` does not create a spurious column (ported from the
-    pre-tendwire renderer)."""
-    text = str(line or "").strip()
-    if "|" not in text:
-        return []
-    if text.startswith("|"):
-        text = text[1:]
-    if text.endswith("|") and not text.endswith("\\|"):
-        text = text[:-1]
-    cells: list[str] = []
-    buf: list[str] = []
-    in_code = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and i + 1 < len(text) and text[i + 1] == "|":
-            buf.append("|")
-            i += 2
-            continue
-        if ch == "`":
-            in_code = not in_code
-            buf.append(ch)
-        elif ch == "|" and not in_code:
-            cells.append("".join(buf).strip())
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    cells.append("".join(buf).strip())
-    return cells
-
-
-def _render_table_html(rows: list[list[str]], *, cell_html: "Callable[[str], str]") -> str:
-    """Render parsed rows (first = header) as a native ``<table bordered striped>`` — the Telegram
-    rich-message path turns this into a real ``PageBlockTable`` (native table), far better than a
-    monospace box. Cell content is rendered rich (bold/code/links) via ``cell_html``."""
-    trimmed = rows[:_TABLE_MAX_ROWS]
-    width = max(len(row) for row in trimmed)
-    grid = [row + [""] * (width - len(row)) for row in trimmed]
-    header, body = grid[0], grid[1:]
-    html_rows = ["<tr>" + "".join(f"<th>{cell_html(cell)}</th>" for cell in header) + "</tr>"]
-    html_rows.extend(
-        "<tr>" + "".join(f"<td>{cell_html(cell)}</td>" for cell in row) + "</tr>" for row in body
-    )
-    return "<table bordered striped>\n" + "\n".join(html_rows) + "\n</table>"
-
-
-def try_render_table(
-    lines: list[str],
-    i: int,
-    *,
-    limit: int = 12000,
-    cell_html: "Callable[[str], str] | None" = None,
-) -> tuple[str, int] | None:
-    """If a GitHub-style pipe table starts at ``lines[i]`` (a row immediately followed by a
-    ``---|---`` delimiter), render the whole block to a native ``<table>`` and return
-    ``(html, next_index)``; otherwise ``None``. Shared by both markdown engines; each passes its own
-    ``cell_html`` inline renderer so cell content matches the surrounding formatting. ``limit`` is
-    accepted for signature stability (the native table isn't length-padded)."""
-    if not (
-        _looks_like_table_row(lines[i])
-        and i + 1 < len(lines)
-        and _looks_like_table_separator(lines[i + 1])
-    ):
-        return None
-    render_cell = cell_html or (lambda c: _inline_markdown_html(c))
-    header = _table_cells(lines[i])
-    data_rows: list[list[str]] = []
-    j = i + 2
-    while j < len(lines) and _looks_like_table_row(lines[j]):
-        if _looks_like_table_separator(lines[j]):
-            j += 1  # absorb a repeated interior `---|---` (LLMs use it to group sections)
-            continue
-        data_rows.append(_table_cells(lines[j]))
-        j += 1
-    if not any(cell.strip() for row in (header, *data_rows) for cell in row):
-        return None  # all-empty header/body → leave as plain text, not an empty table
-    return _render_table_html([header, *data_rows], cell_html=render_cell), j
-
-
 def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
     """Render common agent Markdown into Telegram HTML.
 
     This intentionally covers the small Markdown subset agents emit most often:
-    headings, bold/italic, inline code, fenced code blocks, bullets, and pipe
-    tables. Unknown Markdown remains readable plain text instead of leaking raw
-    HTML.
+    headings, bold/italic, inline code, fenced code blocks, and bullets. Unknown
+    Markdown remains readable plain text instead of leaking raw HTML.
     """
     text = sanitize_text(value, limit).strip()
     if not text:
@@ -205,10 +100,8 @@ def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
     rendered: list[str] = []
     in_code = False
     code_lines: list[str] = []
-    lines = text.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
         if line.strip().startswith("```"):
             if in_code:
                 rendered.append(f"<pre>{html_escape(chr(10).join(code_lines), limit)}</pre>")
@@ -217,42 +110,28 @@ def markdownish_to_html(value: Any, *, limit: int = 12000) -> str:
             else:
                 in_code = True
                 code_lines = []
-            i += 1
             continue
         if in_code:
             code_lines.append(line)
-            i += 1
-            continue
-        # Pipe table (row + `---|---` delimiter): render the block as one aligned <pre> here rather
-        # than leaking per-line `| a | b |` markup through the paragraph path.
-        table = try_render_table(lines, i, limit=limit)
-        if table is not None:
-            rendered.append(table[0])
-            i = table[1]
             continue
         stripped = line.strip()
         if not stripped:
             rendered.append("")
-            i += 1
             continue
         heading = re.match(r"^(#{1,6})\s+(.+)$", stripped)
         if heading:
             inner = _inline_markdown_html(heading.group(2).strip())
             rendered.append(inner if inner.startswith("<b>") and inner.endswith("</b>") else f"<b>{inner}</b>")
-            i += 1
             continue
         bullet = re.match(r"^[-*]\s+(.+)$", stripped)
         if bullet:
             rendered.append(f"• {_inline_markdown_html(bullet.group(1).strip())}")
-            i += 1
             continue
         numbered = re.match(r"^(\d+[.)])\s+(.+)$", stripped)
         if numbered:
             rendered.append(f"{html_escape(numbered.group(1), 16)} {_inline_markdown_html(numbered.group(2).strip())}")
-            i += 1
             continue
         rendered.append(_inline_markdown_html(line))
-        i += 1
     if in_code:
         rendered.append(f"<pre>{html_escape(chr(10).join(code_lines), limit)}</pre>")
     return "\n".join(rendered).strip()
@@ -379,25 +258,8 @@ def render_final_turn_chunks(item: dict[str, Any], entry: dict[str, Any], *, max
 
 def render_pending(item: dict[str, Any], entry: dict[str, Any]) -> str:
     label = html_escape(worker_label(entry), 80)
-    # tendwire's pending payload carries the content as `question` (+ optional structured choices);
-    # prompt_text/text are legacy shapes. Without `question` the user just saw "Input needed."
-    prompt = html_escape(
-        item.get("question") or item.get("prompt_text") or item.get("text") or "Input needed.", 3000
-    )
-    lines = [f"<b>Input Needed</b> · {label}", "", prompt]
-    choices = item.get("choices") if isinstance(item.get("choices"), list) else []
-    numbered = []
-    for i, choice in enumerate(choices, start=1):
-        text = choice.get("label") or choice.get("text") if isinstance(choice, dict) else choice
-        text = html_escape(str(text or ""), 200)
-        if text:
-            numbered.append(f"{i}. {text}")
-    if numbered:
-        lines.append("")
-        lines.extend(numbered)
-        lines.append("")
-        lines.append("<i>Reply with a number or type your answer.</i>")
-    return "\n".join(lines)
+    prompt = html_escape(item.get("prompt_text") or item.get("text") or "Input needed.", 3000)
+    return f"<b>Input Needed</b> · {label}\n\n{prompt}"
 
 
 def pretty_model_label(raw: Any) -> str:

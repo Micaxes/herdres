@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import config, speech, state
+from . import config, decisions, speech, state
 from .managed_bots import MANAGER_BOT_KIND, desired_message_bot_kind, managed_bot_kind_for_entry, managed_bot_token_for_entry
 from .rendering import normalized_status, render_pending, render_status_overview, status_emoji
 from .rich_delivery import edit_feed_item, feed_item_requires_send_split, render_feed_item_html, send_feed_item, split_legacy_message_ids, turn_item_from_source
@@ -351,7 +353,6 @@ _STREAM_DELIVERY_KEYS = (
     "last_stream_hash",
     "last_stream_message_id",
     "last_stream_bot_kind",
-    "last_stream_updated_at",
 )
 
 
@@ -377,25 +378,6 @@ def _entry_put(entry: dict[str, Any], key: str, value: Any) -> bool:
         return False
     entry[key] = value
     return True
-
-
-def _entry_float(entry: dict[str, Any], key: str) -> float:
-    try:
-        return float(entry.get(key) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _same_turn_working_update_too_soon(entry: dict[str, Any], turn_id: str, *, now: float) -> bool:
-    if not turn_id or entry.get("last_stream_turn_id") != turn_id:
-        return False
-    if not entry.get("last_stream_message_id"):
-        return False
-    min_seconds = config.working_update_min_seconds()
-    if min_seconds <= 0:
-        return False
-    last_at = _entry_float(entry, "last_stream_updated_at")
-    return bool(last_at and now - last_at < min_seconds)
 
 
 def _set_final_delivery(
@@ -460,10 +442,6 @@ def _set_stream_delivery(
     if bot_kind:
         changed = _entry_put(entry, "last_stream_bot_kind", bot_kind) or changed
     return changed
-
-
-def _record_stream_update_time(entry: dict[str, Any], now: float | None = None) -> None:
-    entry["last_stream_updated_at"] = f"{(time.time() if now is None else now):.3f}"
 
 
 def _changed_final_should_send_new_message(item: dict[str, Any], entry: dict[str, Any]) -> bool:
@@ -970,6 +948,99 @@ _RENAME_ATTEMPT_CAP = 3
 _REAP_ABSENCE_STREAK = 2
 
 
+# --- Herdr tab-name topic labels (telegram-remote feature) --------------------
+# tendwire strips tab info from the workers it hands herdres, so when the user
+# wants topics named after their Herdr TAB labels we do a small read-only Herdr
+# read here and stamp meta.label — which state.topic_name_for_worker already
+# prefers, so the existing rename-in-place path migrates live topics for free.
+_TAB_LABEL_CACHE: dict[str, Any] = {"at": -1e9, "by_fcwd": {}}
+_TAB_LABEL_TTL_SECONDS = 8.0
+
+
+def _herdr_json(args: list[str]) -> dict[str, Any]:
+    try:
+        out = subprocess.run([config.herdr_bin(), *args], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+    try:
+        data = json.loads(out.stdout or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _tab_labels_by_fcwd() -> dict[str, list[tuple[bool, str, str]]]:
+    """foreground_cwd -> [(focused, pane_id, tab_label)], from a briefly-cached Herdr read."""
+    now = time.monotonic()
+    if now - _TAB_LABEL_CACHE["at"] < _TAB_LABEL_TTL_SECONDS and _TAB_LABEL_CACHE["by_fcwd"]:
+        return _TAB_LABEL_CACHE["by_fcwd"]
+    tabs = (_herdr_json(["tab", "list"]).get("result") or {}).get("tabs") or []
+    label_by_tab = {t.get("tab_id"): compact_ws(t.get("label"), 120) for t in tabs if isinstance(t, dict)}
+    panes = (_herdr_json(["pane", "list"]).get("result") or {}).get("panes") or []
+    by_fcwd: dict[str, list[tuple[bool, str, str]]] = {}
+    for pane in panes:
+        if not isinstance(pane, dict):
+            continue
+        label = label_by_tab.get(pane.get("tab_id"))
+        if not label:
+            continue
+        fcwd = str(pane.get("foreground_cwd") or pane.get("cwd") or "").rstrip("/")
+        by_fcwd.setdefault(fcwd, []).append((bool(pane.get("focused")), str(pane.get("pane_id") or ""), label))
+    _TAB_LABEL_CACHE["at"] = now
+    _TAB_LABEL_CACHE["by_fcwd"] = by_fcwd
+    return by_fcwd
+
+
+def _set_worker_label(worker: dict[str, Any], label: str) -> None:
+    if not label:
+        return
+    meta = worker.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        worker["meta"] = meta
+    meta["label"] = label
+
+
+def _apply_tab_labels(workers: list[dict[str, Any]]) -> None:
+    """Stamp each worker's meta.label with its Herdr tab label. Match a worker to a
+    pane by foreground_cwd; when several panes share a cwd, disambiguate by focus,
+    then fall back to a deterministic id/pane_id ordering so labels stay stable."""
+    if not config.topic_name_from_tab():
+        return
+    by_fcwd = _tab_labels_by_fcwd()
+    if not by_fcwd:
+        return
+    workers_by_fcwd: dict[str, list[dict[str, Any]]] = {}
+    for worker in workers:
+        meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+        fcwd = str(meta.get("foreground_cwd") or meta.get("cwd") or "").rstrip("/")
+        workers_by_fcwd.setdefault(fcwd, []).append(worker)
+    for fcwd, group in workers_by_fcwd.items():
+        panes = list(by_fcwd.get(fcwd) or [])
+        if not panes:
+            continue
+        if len(panes) == 1 and len(group) == 1:
+            _set_worker_label(group[0], panes[0][2])
+            continue
+        # Several panes/workers share this cwd: try an unambiguous focus match first.
+        unmatched: list[dict[str, Any]] = []
+        for worker in group:
+            meta = worker.get("meta") if isinstance(worker.get("meta"), dict) else {}
+            want = bool(meta.get("focused"))
+            same_focus = [i for i, (pf, _pid, _lab) in enumerate(panes) if pf == want]
+            if len(same_focus) == 1:
+                _set_worker_label(worker, panes.pop(same_focus[0])[2])
+            else:
+                unmatched.append(worker)
+        for worker, pane in zip(
+            sorted(unmatched, key=lambda w: compact_ws(w.get("id"), 160)),
+            sorted(panes, key=lambda p: p[1]),
+        ):
+            _set_worker_label(worker, pane[2])
+
+
 def _assign_worker_topic_names(
     store: dict[str, Any], workers: list[dict[str, Any]]
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -1237,12 +1308,11 @@ def _cleanup_topics(
     delete_cap = config.source_orphan_delete_cap()
     deletes_issued = 0
 
-    # Worker-mode reaper (opt-in, DESTRUCTIVE): delete topics of workers that have durably CLOSED/FAILED
-    # and left the tendwire snapshot. Positional worker-id churn across herdr restarts (claude-2 ->
+    # Worker-mode reaper (opt-in, DESTRUCTIVE): delete topics of workers that have durably FINISHED and
+    # left the tendwire snapshot. Positional worker-id churn across herdr restarts (claude-2 ->
     # claude-2-2 for a fresh terminal) otherwise strands the old pane's topic forever, and its squatted
-    # name forces the live pane's topic to a " 2" suffix. Guards: opt-in flag, strict closed/failed
-    # liveness (NOT 'done'/'idle'), absence across _REAP_ABSENCE_STREAK passes, a non-degraded snapshot,
-    # and the shared per-pass delete cap.
+    # name forces the live pane's topic to a " 2" suffix. Guards: opt-in flag, finished status, absence
+    # across _REAP_ABSENCE_STREAK passes, a non-empty snapshot, and the shared per-pass delete cap.
     reap_enabled = (
         config.reap_closed_worker_topics()
         and config.source_topic_mode() == "worker"
@@ -1503,12 +1573,8 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
     feed_item = turn_item_from_source(delivery_item, entry)
     if entry.get("last_stream_turn_id") == turn_id and entry.get("last_stream_hash") == content_hash:
         return False
-    now = time.time()
-    if _same_turn_working_update_too_soon(entry, turn_id, now=now):
-        return False
     if runtime.dry_run:
         _set_stream_delivery(entry, turn_id=turn_id, content_hash=content_hash, placeholder=True)
-        _record_stream_update_time(entry, now)
         return True
     telegram = _telegram_state(store)
     api_token, bot_kind = _delivery_bot(store, entry)
@@ -1542,7 +1608,6 @@ def _deliver_working(store: dict[str, Any], item: dict[str, Any], entry: dict[st
             message_id=str(sent.get("message_id") or entry.get("last_stream_message_id") or ""),
             bot_kind=bot_kind,
         )
-        _record_stream_update_time(entry, now)
         _record_delivery_success(entry, bot_kind)
         state.bind_message_to_worker(store, entry.get("last_stream_message_id"), entry, topic_id=thread_id, kind="working", turn_id=turn_id, bot_kind=bot_kind)
         return True
@@ -1755,6 +1820,72 @@ def _deliver_pending(store: dict[str, Any], item: dict[str, Any], runtime: SyncR
     return False
 
 
+def _decision_client(store: dict[str, Any], runtime: SyncRuntime, entry: dict[str, Any] | None):
+    api_token, bot_kind = _delivery_bot(store, entry) if entry else (None, "")
+    client = runtime.telegram.with_token(api_token) if api_token else runtime.telegram
+    return client, bot_kind
+
+
+def _deliver_decisions(store: dict[str, Any], runtime: SyncRuntime, *, host_id: str, chat_id: str) -> int:
+    """Surface pending Claude prompts as native reply keyboards in the worker's topic, and take the
+    keyboard down when the prompt is answered (remotely via P3, or physically at the workstation).
+
+    Resolution is host-local (see decisions.resolve_decisions); a resolver failure degrades to a
+    no-op (the plain attention notice still fires). Auto-disable is gated on the pending FILE, not the
+    resolver, so a transient `herdr api snapshot` hiccup can never wrongly retract a live keyboard."""
+    if not decisions.decisions_enabled():
+        return 0
+    entries = state.source_worker_entries(store)  # decision entry_keys come from worker entries
+    try:
+        resolved = decisions.resolve_decisions(store, host_id)
+    except Exception:  # noqa: BLE001 - never let a decision failure break the sync loop
+        resolved = []
+    resolved_by_topic = {d.topic_id: d for d in resolved}
+    changed = 0
+    # 1) Post new / changed decisions (idempotent on decision_id + content_hash).
+    for d in resolved:
+        existing = decisions.get_active(store, d.topic_id)
+        if existing and existing.get("decision_id") == d.decision_id and existing.get("content_hash") == d.content_hash():
+            continue
+        entry = entries.get(d.entry_key)
+        html = decisions.render_decision_html(d)
+        keyboard = decisions.reply_keyboard(d)
+        message_id = "0"
+        bot_kind = ""
+        if not runtime.dry_run:
+            client, bot_kind = _decision_client(store, runtime, entry)
+            sent = client.send_message(chat_id, html, thread_id=d.topic_id, notify=True, reply_markup=keyboard)
+            if not sent.get("ok"):
+                if entry is not None:
+                    _record_delivery_error(entry, sent, bot_kind)
+                continue
+            message_id = str(sent.get("message_id") or "0")
+            if entry is not None:
+                _record_delivery_success(entry, bot_kind)
+                state.bind_message_to_worker(store, message_id, entry, topic_id=d.topic_id, kind="decision", turn_id=d.decision_id, bot_kind=bot_kind)
+        record = decisions.active_record_from(d, message_id)
+        record["entry_key"] = d.entry_key
+        record["bot_kind"] = bot_kind
+        decisions.set_active(store, d.topic_id, record)
+        changed += 1
+    # 2) Auto-disable decisions whose pending file is gone (answered at the workstation, or pane closed).
+    for topic_id, record in list(decisions._active_map(store).items()):
+        if not isinstance(record, dict):
+            decisions.clear_active(store, topic_id)
+            continue
+        if topic_id in resolved_by_topic:
+            continue  # still pending this tick
+        if decisions.pending_file_present(str(record.get("session_id") or "")):
+            continue  # file still there -> keep the keyboard (guards against a resolver hiccup)
+        if not runtime.dry_run:
+            entry = entries.get(str(record.get("entry_key") or ""))
+            client, _ = _decision_client(store, runtime, entry)
+            client.send_message(chat_id, "✅ Answered at the workstation.", thread_id=topic_id, reply_markup=decisions.remove_keyboard())
+        decisions.clear_active(store, topic_id)
+        changed += 1
+    return changed
+
+
 def _bootstrap_existing_turns(store: dict[str, Any], turns_payload: dict[str, Any], pending_payload: dict[str, Any]) -> int:
     """Record current Tendwire rows as seen on first deployment.
 
@@ -1916,6 +2047,11 @@ def _sync_turns(
         # Same yield between delivered pending prompts (each is a send under the lock).
         if yield_barrier is not None and delivered and p_idx + 1 < pending_count:
             yield_barrier()
+    # Remote-answer: surface Claude's follow-up prompts as reply keyboards in the worker topic and
+    # retract them when answered. host_id comes from the payload the loop already has.
+    host_id = str(pending_payload.get("host_id") or turns_payload.get("host_id") or "")
+    decision_changes = _deliver_decisions(store, runtime, host_id=host_id, chat_id=chat_id)
+    counts["sent"] += decision_changes
     return counts
 
 
@@ -1990,6 +2126,7 @@ def sync_once(store: dict[str, Any], runtime: SyncRuntime) -> dict[str, Any]:
     config.require_source_mode()
     chat_id = config.telegram_chat_id(store)
     snapshot = runtime.tendwire.snapshot()
+    _apply_tab_labels(_workers(snapshot))
     turns_payload = runtime.tendwire.turns()
     pending_payload = runtime.tendwire.pending()
     for name, payload in (("snapshot", snapshot), ("turns", turns_payload), ("pending", pending_payload)):

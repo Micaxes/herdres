@@ -14,14 +14,14 @@ import json
 import sys
 from typing import Any
 
-from herdres_connector import config, doctor, speech, state
+from herdres_connector import config, decisions, doctor, speech, state
 from herdres_connector.managed_bots import managed_bot_kind_for_username
 from herdres_connector.safe import compact_ws, public_prune, sanitize_text, short_hash
 from herdres_connector.source_sync import SyncRuntime, sync_once
 from herdres_connector.telegram_delivery import TelegramClient
 from herdres_connector.tendwire_client import TendwireClient
 
-VERSION = "0.6.0-tendwired-source-only"
+VERSION = "0.5.0-tendwired-source-only"
 SAFE_SEND_FAILURE_REPLY = "Could not send safely. Refresh status and choose the target again."
 
 
@@ -190,52 +190,6 @@ def _target_for_entry(entry: dict[str, Any]) -> dict[str, str]:
     return {"space_id": space_id} if space_id else {}
 
 
-# Choices whose selection needs the owner to then TYPE something (the picker's "write your own"
-# option): the turn adapter stamps these ids on AskUserQuestion's custom option and ExitPlanMode's
-# revise option. A bare number selecting one of these is refused so we never send a digit that leaves
-# the pane waiting for text the owner didn't provide.
-_FREETEXT_CHOICE_IDS = {"custom", "revise"}
-
-
-def _pending_number_reply(entry: dict[str, Any], text: str) -> tuple[str, str] | None:
-    """Validate a bare-number reply against the worker's LIVE pending prompt (backend-captured
-    question + choices). Returns (text_to_send, "") when valid — the digit itself, which the pane's
-    picker interprets natively — or ("", error_reply) to fail closed (stale prompt, out of range,
-    custom choice). None = not a number-reply situation; the text passes through unchanged."""
-    clean = str(text or "").strip()
-    if not clean.isdigit() or len(clean) > 2:
-        return None
-    try:
-        payload = TendwireClient().pending()
-    except Exception:
-        return None  # pending unavailable: don't block, pass the number through
-    worker_id = str(entry.get("active_worker_id") or entry.get("tendwire_worker_id") or "")
-    for row in payload.get("pending_interactions", []) if isinstance(payload, dict) else []:
-        if not isinstance(row, dict) or str(row.get("worker_id") or "") != worker_id:
-            continue
-        if str(row.get("status") or "open") != "open":
-            continue
-        choices = row.get("choices") if isinstance(row.get("choices"), list) else []
-        if not choices:
-            return None  # synthetic/choice-less pending: nothing to validate against
-        index = int(clean)
-        if not 1 <= index <= len(choices):
-            return ("", f"That prompt has {len(choices)} choices — reply 1–{len(choices)}, or type your answer.")
-        choice = choices[index - 1] if isinstance(choices[index - 1], dict) else {}
-        # tendwire dropped the private send_text 'value' from public pending.list (PR #3 review
-        # hardening), so a free-text option is now identified by its stable choice_id. The old
-        # empty-value check stays as a backstop for pre-sync daemons that still publish 'value'.
-        choice_id = str(choice.get("choice_id") or "").strip().lower()
-        value = choice.get("value")
-        needs_custom_text = choice_id in _FREETEXT_CHOICE_IDS or (
-            value is not None and not str(value).strip()
-        )
-        if needs_custom_text:
-            return ("", "That choice takes a custom answer — just type it as text.")
-        return (clean, "")
-    return None  # no live pending with choices for this worker: pass through
-
-
 def _command_request(entry: dict[str, Any], payload: dict[str, Any], text: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -284,6 +238,15 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             state.save_state(store)
             return voice_reply
         text = _send_text_from_payload(payload)
+        # Remote decision answer: while a Claude follow-up prompt is pending in this topic, the pane
+        # is BLOCKED on it, so every message here answers it (a button label picks that option; any
+        # other text is a write-in). Replays the answer as calibrated herdr send-keys and returns a
+        # keyboard-removal reply. Returns None (falls through) when no decision is active.
+        if text:
+            decision_reply = decisions.handle_decision_answer(store, str(payload.get("topic_id") or ""), text)
+            if decision_reply is not None:
+                state.save_state(store)
+                return decision_reply
         voice_payload = speech.is_voice_payload(payload)
         alias_source = text if text else _clean_voice_caption(payload.get("caption") or payload.get("text") or "")
         alias, clean_text = _split_target_alias(alias_source)
@@ -328,14 +291,6 @@ def command_reply(payload: dict[str, Any]) -> dict[str, Any]:
             if voice_payload:
                 return {"handled": True, "reply": _voice_unavailable_reply(payload)}
             return {"handled": True, "reply": "Send a message in this topic or use /send <instruction>."}
-        # A bare number answering a live captured prompt: validate against the pending's choices and
-        # fail closed on stale/out-of-range/custom, else send the digit (the picker's native input).
-        number_reply = _pending_number_reply(entry, text)
-        if number_reply is not None:
-            mapped, error_reply = number_reply
-            if error_reply:
-                return {"handled": True, "reply": error_reply}
-            text = mapped
         # Reply-to-voice auto-mode (#4): replying to one of this pane's voice notes speaks the next
         # reply back. One-shot flag consumed at delivery (_speak_reply in source_sync).
         if speech.speech_reply_on_voice_reply_enabled() and state.message_is_voice_reply(

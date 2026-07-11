@@ -4,12 +4,30 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 from . import config
 from .safe import sanitize_text
 from .tendwire_client import TendwireClient
+
+# telegram-remote change: on macOS the services run as launchd agents, not systemd
+# user units, so map the upstream systemd unit names to our launchd labels and
+# probe with `launchctl list`.
+_LAUNCHD_LABELS = {
+    "tendwired.service": "com.telegram-remote.tendwired",
+    "herdres-gateway.service": "com.telegram-remote.herdres-gateway",
+    "herdres.service": "com.telegram-remote.herdres-sync",
+}
+
+
+def _launchctl_is_active(label: str) -> dict[str, Any]:
+    proc = subprocess.run(["launchctl", "list", label], capture_output=True, text=True, check=False)
+    loaded = proc.returncode == 0
+    running = loaded and '"PID"' in proc.stdout
+    status = "running" if running else ("loaded" if loaded else "not-loaded")
+    return {"unit": label, "active": running, "status": status, "returncode": proc.returncode}
 
 
 def _systemctl_is_active(unit: str) -> dict[str, Any]:
@@ -18,12 +36,21 @@ def _systemctl_is_active(unit: str) -> dict[str, Any]:
     return {"unit": unit, "active": proc.returncode == 0, "status": status, "returncode": proc.returncode}
 
 
+def _service_is_active(unit: str) -> dict[str, Any]:
+    if sys.platform == "darwin":
+        return _launchctl_is_active(_LAUNCHD_LABELS.get(unit, unit))
+    return _systemctl_is_active(unit)
+
+
 def source_services() -> dict[str, Any]:
-    services = {unit: _systemctl_is_active(unit) for unit in config.SOURCE_SERVICES}
+    services = {unit: _service_is_active(unit) for unit in config.SOURCE_SERVICES}
     return {"ok": all(item["active"] for item in services.values()), "services": services}
 
 
 def legacy_timer() -> dict[str, Any]:
+    if sys.platform == "darwin":
+        # No legacy systemd timer exists on macOS; nothing to disable.
+        return {"ok": True, "legacy_timer": {"unit": config.LEGACY_TIMER, "active": False, "status": "n/a"}}
     status = _systemctl_is_active(config.LEGACY_TIMER)
     return {"ok": not status["active"], "legacy_timer": status}
 

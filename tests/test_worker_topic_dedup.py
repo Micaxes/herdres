@@ -23,7 +23,7 @@ from herdres_connector.source_sync import (
     sync_once,
 )
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from _fakes import FakeTelegram, FakeTendwire, _store
 
 
 @pytest.fixture(autouse=True)

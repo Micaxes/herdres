@@ -74,6 +74,22 @@ def source_topic_mode(env: Any | None = None) -> str:
     return value if value in TOPIC_MODES else "space"
 
 
+def topic_name_from_tab(env: Any | None = None) -> bool:
+    """telegram-remote feature: name worker topics after the user's Herdr TAB label
+    (e.g. "telegram-bot", "log-in") instead of the cwd basename. Off by default;
+    when on, herdres does a small read-only `herdr tab list` + `herdr pane list`
+    lookup to resolve labels (the only spot this branch touches Herdr directly)."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_TOPIC_NAME_FROM_TAB", "0") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def herdr_bin(env: Any | None = None) -> str:
+    """The real Herdr binary for the tab-name lookup (HERDR_REAL_BIN, else `herdr`)."""
+    source = os.environ if env is None else env
+    return str(source.get("HERDR_REAL_BIN") or source.get("HERDR_BIN") or "herdr").strip() or "herdr"
+
+
 def delete_done_council_topics(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_DELETE_DONE_COUNCIL_TOPICS", "1") or "").strip().lower()
@@ -98,12 +114,7 @@ def topic_status_icons_enabled(env: Any | None = None) -> bool:
 def pinned_status_enabled(env: Any | None = None) -> bool:
     """Whether to post the pinned status board(s) — the global overview pinned in
     General and the per-topic status line — which show each agent's selected model.
-    Default on; HERDRES_PINNED_STATUS=0 turns both off.
-
-    Note: this only stops *updating* the boards. Any boards already pinned from a
-    prior run stay pinned, frozen at their last content — set the flag off before
-    first run, or unpin the existing boards manually, to avoid a stale board that
-    reads as live status."""
+    Default on; HERDRES_PINNED_STATUS=0 turns both off."""
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_PINNED_STATUS", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
@@ -118,16 +129,6 @@ def ack_on_send(env: Any | None = None) -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
-def stable_worker_key_enabled(env: Any | None = None) -> bool:
-    """Reconcile worker entries by tendwire's meta.stable_key (a session-independent per-pane key) so a
-    worker-id re-letter across a herdr restart (claude-2 -> claude-2-2 for the same terminal) maps back
-    to the SAME entry/topic instead of stranding a duplicate. Default ON and safe-degrading: when the
-    snapshot carries no stable_key (older tendwire) it falls back to worker-id keying, i.e. today's
-    behavior. HERDRES_STABLE_WORKER_KEY=0 forces the legacy worker-id-only keying."""
-    source = os.environ if env is None else env
-    value = str(source.get("HERDRES_STABLE_WORKER_KEY", "1") or "").strip().lower()
-    return value not in {"0", "false", "no", "off"}
-
 def reap_closed_worker_topics(env: Any | None = None) -> bool:
     """Worker mode only: delete the Telegram topic of a worker that has durably FINISHED and left the
     tendwire snapshot. herdr/tendwire re-letters worker ids positionally across restarts (claude-2 ->
@@ -139,6 +140,17 @@ def reap_closed_worker_topics(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_REAP_CLOSED_WORKER_TOPICS", "") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def stable_worker_key_enabled(env: Any | None = None) -> bool:
+    """Reconcile worker entries by tendwire's meta.stable_key (a session-independent per-pane key) so a
+    worker-id re-letter across a herdr restart (claude-2 -> claude-2-2 for the same terminal) maps back
+    to the SAME entry/topic instead of stranding a duplicate. Default ON and safe-degrading: when the
+    snapshot carries no stable_key (older tendwire) it falls back to worker-id keying, i.e. today's
+    behavior. HERDRES_STABLE_WORKER_KEY=0 forces the legacy worker-id-only keying."""
+    source = os.environ if env is None else env
+    value = str(source.get("HERDRES_STABLE_WORKER_KEY", "1") or "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def delete_topic_icon_service_messages(env: Any | None = None) -> bool:
@@ -163,19 +175,6 @@ def offlock_interpane_yield_enabled(env: Any | None = None) -> bool:
     source = os.environ if env is None else env
     value = str(source.get("HERDRES_OFFLOCK_INTERPANE_YIELD", "1") or "").strip().lower()
     return value not in {"0", "false", "no", "off"}
-
-
-def working_update_min_seconds(env: Any | None = None) -> int:
-    """Minimum seconds between same-turn Working card edits.
-
-    The first Working card for a turn is still immediate. This only bounds
-    repeat edits for a turn that is already visible in Telegram.
-    """
-    source = os.environ if env is None else env
-    try:
-        return max(0, int(str(source.get("HERDR_TELEGRAM_TOPICS_WORKING_UPDATE_MIN_SECONDS", "30") or "30")))
-    except (TypeError, ValueError):
-        return 30
 
 
 def source_orphan_delete_cap(env: Any | None = None) -> int:

@@ -15,7 +15,7 @@ import re
 from typing import Any
 
 from . import config
-from .rendering import html_to_plain, split_text_chunks, try_render_table, worker_label
+from .rendering import html_to_plain, split_text_chunks, worker_label
 from .safe import sanitize_text
 from .telegram_delivery import RateLimited, TelegramClient, TelegramError
 
@@ -233,15 +233,6 @@ def _render_final_reply_blocks(lines: list[str], *, seen_heading: bool = False) 
             else:
                 class_attr = f' class="language-{html.escape(language, quote=True)}"' if language else ""
                 parts.append(f"<pre><code{class_attr}>{_html_text(chr(10).join(code_lines), 3000)}</code></pre>")
-            previous_blank = False
-            continue
-        # Pipe table (row + `---|---` delimiter): render as a native <table> (the rich path turns it
-        # into a PageBlockTable). Cells use _rich_inline so bold/code/links inside cells render. Must
-        # precede the paragraph fallthrough, which would otherwise emit raw `| a | b |` / `|---|`.
-        table = try_render_table(lines, idx, cell_html=lambda c: _rich_inline(c, 160))
-        if table is not None:
-            parts.append(table[0])
-            idx = table[1]
             previous_blank = False
             continue
         if _is_heading(line, first_block=not seen_heading, previous_blank=previous_blank):
@@ -552,10 +543,6 @@ def _classify_telegram_error(error: Exception) -> str:
     return "transient"
 
 
-def _retry_rich_delivery(kind: str, error: Exception) -> dict[str, Any]:
-    return {"ok": False, "format": "rich", "kind": kind, "error": sanitize_text(str(error), 300)}
-
-
 def _fallback_send(
     client: TelegramClient,
     chat_id: str,
@@ -622,8 +609,6 @@ def send_rich_message(
         raise
     except TelegramError as exc:
         kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
         if kind == "capability":
             mark_rich_disabled(telegram, str(exc))
         elif kind == "bad_request":
@@ -671,8 +656,6 @@ def edit_rich_message(
         raise
     except TelegramError as exc:
         kind = _classify_telegram_error(exc)
-        if kind == "transient":
-            return _retry_rich_delivery(kind, exc)
         if kind == "not_modified":
             return {"ok": True, "format": "rich", "kind": kind, "message_id": str(message_id)}
         if kind in {"not_found", "topic_not_found"}:

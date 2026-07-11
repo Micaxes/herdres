@@ -281,6 +281,7 @@ def handle_message(message: dict[str, Any], token: str, *, bot_key: str | None =
     payload = speech.pretranscribe_voice_payload(payload, bot_token=token)
     result = run_herdres_command(payload)
     reply = sanitize_text(result.get("reply"), 3500).strip()
+    reply_markup = result.get("reply_markup") if isinstance(result.get("reply_markup"), dict) else None
     if reply:
         TelegramClient(token=token).send_message(
             str(payload["chat_id"]),
@@ -288,6 +289,7 @@ def handle_message(message: dict[str, Any], token: str, *, bot_key: str | None =
             thread_id=str(payload["topic_id"]),
             reply_to_message_id=str(payload["message_id"]),
             notify=True,
+            reply_markup=reply_markup,
         )
 
 

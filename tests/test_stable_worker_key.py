@@ -10,7 +10,7 @@ import pytest
 from herdres_connector import config, state
 from herdres_connector.source_sync import SyncRuntime, sync_once
 
-from test_source_only import FakeTelegram, FakeTendwire, _store
+from _fakes import FakeTelegram, FakeTendwire, _store
 
 
 @pytest.fixture(autouse=True)
